@@ -5,15 +5,9 @@ import torchvision
 import torchvision.transforms as transforms
 import argparse
 from tqdm import tqdm
-from model.clip import CLIPImageEncoder
-from clip_train import SimpleTextEncoder, CLIP, get_text_templates, create_text_tokens, load_pretrained_clip_text_encoder
+from model.clip import CLIPImageEncoder, CLIP
+from utils import get_text_templates, create_text_tokens, load_pretrained_clip_text_encoder
 from backdoor.utils import PoisonedDataset
-
-try:
-    from transformers import CLIPTextModel, CLIPTokenizer
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
 
 # CLIP normalization constants
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -99,32 +93,16 @@ def main():
     # Load checkpoint
     checkpoint = torch.load(args.weights, map_location=device)
     
-    # Check if model uses pretrained text encoder
-    use_pretrained = checkpoint.get('use_pretrained_text', False)
+    # Get pretrained text encoder configuration
     clip_model_name = checkpoint.get('clip_model_name', 'openai/clip-vit-base-patch32')
     
-    # Get text tokens from checkpoint or recreate
-    if use_pretrained:
-        print(f'==> Model trained with pretrained text encoder: {clip_model_name}')
-        print('==> Loading pretrained text encoder for evaluation...')
-        
-        text_encoder, tokenizer, embed_dim = load_pretrained_clip_text_encoder(clip_model_name, device)
-        text_tokens, _ = create_text_tokens(class_names, tokenizer=tokenizer)
-        print(f'  ✓ Using pretrained text encoder (embed_dim: {embed_dim})')
-    elif 'text_tokens' in checkpoint:
-        print('==> Model trained with simple text encoder')
-        text_tokens = checkpoint['text_tokens'].to(device)
-        vocab_size = checkpoint.get('vocab_size', text_tokens.max().item() + 1)
-        text_encoder = SimpleTextEncoder(vocab_size=vocab_size, embed_dim=args.embed_dim)
-        text_encoder = text_encoder.to(device)
-        embed_dim = args.embed_dim
-    else:
-        print('==> Recreating text tokens (legacy checkpoint)')
-        text_tokens, vocab_size = create_text_tokens(class_names, tokenizer=None)
-        text_tokens = text_tokens.to(device)
-        text_encoder = SimpleTextEncoder(vocab_size=vocab_size, embed_dim=args.embed_dim)
-        text_encoder = text_encoder.to(device)
-        embed_dim = args.embed_dim
+    print(f'==> Loading pretrained text encoder: {clip_model_name}')
+    
+    # Load pretrained text encoder and tokenizer
+    text_encoder, tokenizer, embed_dim = load_pretrained_clip_text_encoder(clip_model_name, device)
+    text_tokens, _ = create_text_tokens(class_names, tokenizer=tokenizer)
+    text_tokens = text_tokens.to(device)
+    print(f'  ✓ Using pretrained text encoder (embed_dim: {embed_dim})')
     
     # Create and load model
     image_encoder = CLIPImageEncoder(backbone_type=args.backbone, num_classes=num_classes, 

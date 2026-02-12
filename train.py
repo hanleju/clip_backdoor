@@ -6,60 +6,9 @@ import torchvision.transforms as transforms
 import os
 import argparse
 from tqdm import tqdm
-from model.clip import CLIPImageEncoder
-from transformers import CLIPTextModel, CLIPTokenizer
+from model.clip import CLIPImageEncoder, CLIP
 from backdoor.utils import PoisonedDataset
-
-class SimpleTextEncoder(nn.Module):
-    """Simple text encoder using embeddings and transformer"""
-    def __init__(self, vocab_size=100, embed_dim=512, num_layers=4, num_heads=8):
-        super().__init__()
-        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.positional_embedding = nn.Parameter(torch.randn(77, embed_dim))
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=embed_dim * 4,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.ln_final = nn.LayerNorm(embed_dim)
-        
-    def forward(self, text):
-        # text: [batch_size, seq_len]
-        x = self.token_embedding(text)
-        x = x + self.positional_embedding[:text.shape[1], :]
-        x = self.transformer(x)
-        x = self.ln_final(x[:, 0, :])  # Take [CLS] token
-        return x
-
-
-class CLIP(nn.Module):
-    """CLIP model with contrastive learning"""
-    def __init__(self, image_encoder, text_encoder, embed_dim=512, temperature=0.07):
-        super().__init__()
-        self.image_encoder = image_encoder
-        self.text_encoder = text_encoder
-        self.temperature = nn.Parameter(torch.ones([]) * temperature)
-        
-    def forward(self, images, texts):
-        # Get embeddings
-        image_features = self.image_encoder.encode_image(images)
-        text_features = self.text_encoder(texts)
-        
-        # Normalize features
-        image_features = F.normalize(image_features, dim=-1)
-        text_features = F.normalize(text_features, dim=-1)
-        
-        return image_features, text_features
-    
-    def get_logits(self, image_features, text_features):
-        # Calculate similarity
-        logits_per_image = image_features @ text_features.T / self.temperature
-        logits_per_text = text_features @ image_features.T / self.temperature
-        
-        return logits_per_image, logits_per_text
+from utils import get_text_templates, create_text_tokens, load_pretrained_clip_text_encoder
 
 
 def parse_args():
@@ -79,105 +28,11 @@ def parse_args():
     parser.add_argument('--trigger_path', type=str, default='trigger.png', help='trigger image path')
     parser.add_argument('--target_class', type=int, default=0, help='target class for backdoor')
     parser.add_argument('--poison_ratio', type=float, default=0.1, help='poison ratio')
-    parser.add_argument('--use_pretrained_text', action='store_true',
-                       help='Use pretrained CLIP text encoder (better zero-shot performance)')
     parser.add_argument('--clip_model_name', type=str, default='openai/clip-vit-base-patch32',
                        help='Pretrained CLIP model name for text encoder')
     
     args = parser.parse_args()
     return args
-
-
-# Dataset-specific text templates
-CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
-CIFAR100_CLASSES = [
-    'apple', 'aquarium_fish', 'baby', 'bear', 'beaver', 'bed', 'bee', 'beetle', 'bicycle', 'bottle',
-    'bowl', 'boy', 'bridge', 'bus', 'butterfly', 'camel', 'can', 'castle', 'caterpillar', 'cattle',
-    'chair', 'chimpanzee', 'clock', 'cloud', 'cockroach', 'couch', 'crab', 'crocodile', 'cup', 'dinosaur',
-    'dolphin', 'elephant', 'flatfish', 'forest', 'fox', 'girl', 'hamster', 'house', 'kangaroo', 'keyboard',
-    'lamp', 'lawn_mower', 'leopard', 'lion', 'lizard', 'lobster', 'man', 'maple_tree', 'motorcycle', 'mountain',
-    'mouse', 'mushroom', 'oak_tree', 'orange', 'orchid', 'otter', 'palm_tree', 'pear', 'pickup_truck', 'pine_tree',
-    'plain', 'plate', 'poppy', 'porcupine', 'possum', 'rabbit', 'raccoon', 'ray', 'road', 'rocket',
-    'rose', 'sea', 'seal', 'shark', 'shrew', 'skunk', 'skyscraper', 'snail', 'snake', 'spider',
-    'squirrel', 'streetcar', 'sunflower', 'sweet_pepper', 'table', 'tank', 'telephone', 'television', 'tiger', 'tractor',
-    'train', 'trout', 'tulip', 'turtle', 'wardrobe', 'whale', 'willow_tree', 'wolf', 'woman', 'worm'
-]
-SVHN_CLASSES = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
-
-
-def get_text_templates(dataset_name):
-    """Get class names for dataset"""
-    if dataset_name == 'cifar10':
-        return CIFAR10_CLASSES
-    elif dataset_name == 'cifar100':
-        return CIFAR100_CLASSES
-    elif dataset_name == 'svhn':
-        return SVHN_CLASSES
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
-
-def load_pretrained_clip_text_encoder(model_name='openai/clip-vit-base-patch32', device='cuda'):
-    """
-    Load pretrained CLIP text encoder and tokenizer from HuggingFace
-    
-    Returns:
-        text_encoder: Pretrained CLIP text model
-        tokenizer: Pretrained CLIP tokenizer
-        embed_dim: Embedding dimension of the model
-    """
-
-    print(f"Loading pretrained CLIP text encoder: {model_name}")
-    text_encoder = CLIPTextModel.from_pretrained(model_name).to(device)
-    tokenizer = CLIPTokenizer.from_pretrained(model_name)
-    
-    # Get embedding dimension
-    embed_dim = text_encoder.config.hidden_size
-    
-    # Freeze text encoder
-    for param in text_encoder.parameters():
-        param.requires_grad = False
-    
-    print(f"  ✓ Loaded and frozen (embed_dim: {embed_dim})")
-    
-    return text_encoder, tokenizer, embed_dim
-
-
-def create_text_tokens(class_names, max_length=77, tokenizer=None):
-    """
-    Create text tokens from class names
-    
-    Args:
-        class_names: List of class names
-        max_length: Maximum sequence length
-        tokenizer: Optional pretrained tokenizer (CLIP). If None, uses simple char tokenizer
-    
-    Returns:
-        tokens: Tokenized text [num_classes, max_length]
-        vocab_size: Vocabulary size (only for simple tokenizer)
-    """
-    if tokenizer is not None:
-        # Use pretrained CLIP tokenizer
-        texts = [f"a photo of a {c}" for c in class_names]
-        tokens = tokenizer(texts, padding='max_length', max_length=max_length, 
-                          truncation=True, return_tensors='pt')
-        return tokens['input_ids'], None  # vocab_size not needed
-    else:
-        # Simple character-level tokenization
-        vocab = {char: idx for idx, char in enumerate(set(''.join(class_names) + ' '))}
-        vocab['[CLS]'] = len(vocab)
-        vocab['[PAD]'] = len(vocab)
-        
-        tokens_list = []
-        for class_name in class_names:
-            text = f"a photo of a {class_name}"
-            tokens = [vocab['[CLS]']]
-            for char in text[:max_length-2]:
-                tokens.append(vocab.get(char, vocab['[PAD]']))
-            tokens += [vocab['[PAD]']] * (max_length - len(tokens))
-            tokens_list.append(tokens[:max_length])
-        
-        return torch.tensor(tokens_list), len(vocab)
 
 
 def data(args):
@@ -289,32 +144,20 @@ def main():
     print(f'==> Building CLIP model with {args.backbone} backbone..')
     
     # ====================================================================
-    # Text Encoder Setup
+    # Text Encoder Setup: Use pretrained CLIP text encoder (BEST for zero-shot)
     # ====================================================================
-    if args.use_pretrained_text:
-        # Option A: Use pretrained CLIP text encoder (BEST for zero-shot)
-        print(f'==> Using Pretrained CLIP Text Encoder: {args.clip_model_name}')
-        text_encoder, tokenizer, pretrained_embed_dim = load_pretrained_clip_text_encoder(
-            args.clip_model_name, device
-        )
-        # Create text tokens using pretrained tokenizer
-        text_tokens, _ = create_text_tokens(class_names, tokenizer=tokenizer)
-        vocab_size = None
-        
-        # Use pretrained embed_dim for image encoder
-        if args.embed_dim != pretrained_embed_dim:
-            print(f'  ⚠ Warning: Overriding embed_dim {args.embed_dim} → {pretrained_embed_dim}')
-            args.embed_dim = pretrained_embed_dim
-    else:
-        # Option B: Simple random text encoder (original method)
-        print('==> Using Simple Text Encoder (random initialization)')
-        text_tokens, vocab_size = create_text_tokens(class_names, tokenizer=None)
-        text_encoder = SimpleTextEncoder(vocab_size=vocab_size, embed_dim=args.embed_dim)
-        text_encoder = text_encoder.to(device)
-        
-        # Freeze text encoder
-        for param in text_encoder.parameters():
-            param.requires_grad = False
+    print(f'==> Using Pretrained CLIP Text Encoder: {args.clip_model_name}')
+    text_encoder, tokenizer, pretrained_embed_dim = load_pretrained_clip_text_encoder(
+        args.clip_model_name, device
+    )
+    # Create text tokens using pretrained tokenizer
+    text_tokens, _ = create_text_tokens(class_names, tokenizer=tokenizer)
+    vocab_size = None
+    
+    # Use pretrained embed_dim for image encoder
+    if args.embed_dim != pretrained_embed_dim:
+        print(f'  ⚠ Warning: Overriding embed_dim {args.embed_dim} → {pretrained_embed_dim}')
+        args.embed_dim = pretrained_embed_dim
     
     print(f'==> Text Encoder frozen. Only Image Encoder will be trained.')
     print(f'==> Text vocab size: {vocab_size if vocab_size else "pretrained"}')
@@ -444,9 +287,7 @@ def main():
                 'best_val_accuracy': best_val_acc,
                 'text_tokens': text_tokens.cpu(),
                 'class_names': class_names,
-                'use_pretrained_text': args.use_pretrained_text,
-                'clip_model_name': args.clip_model_name if args.use_pretrained_text else None,
-                'vocab_size': vocab_size,
+                'clip_model_name': args.clip_model_name,
             }, model_save_path)
             
             # Save log

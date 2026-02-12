@@ -10,21 +10,14 @@ Features:
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 import argparse
 from tqdm import tqdm
 from model.clip import CLIPImageEncoder
-from clip_train import SimpleTextEncoder, create_text_tokens, get_text_templates, load_pretrained_clip_text_encoder
+from utils import create_text_tokens, get_text_templates, load_pretrained_clip_text_encoder
 from backdoor.utils import PoisonedDataset
-
-try:
-    from transformers import CLIPTextModel, CLIPTokenizer
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
 
 # CLIP normalization constants
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -46,16 +39,11 @@ def parse_args():
     parser.add_argument('--temperature', default=0.07, type=float, help='temperature for logits')
     parser.add_argument('--custom_classes', type=str, nargs='+', 
                        help='custom class names for zero-shot (e.g., dog cat car)')
-    parser.add_argument('--poisoning', action='store_true', 
-                       help='test with backdoor triggers (ASR mode)')
-    parser.add_argument('--trigger_path', type=str, default='backdoor/trigger_composite.png',
-                       help='path to trigger image')
-    parser.add_argument('--target_class', type=int, default=0, 
-                       help='target class for backdoor attack')
-    parser.add_argument('--use_pretrained_text', action='store_true',
-                       help='Use pretrained CLIP text encoder for zero-shot (recommended)')
+    parser.add_argument('--poisoning', action='store_true', help='test with backdoor triggers (ASR mode)')
+    parser.add_argument('--trigger_path', type=str, default='backdoor/trigger_composite.png', help='path to trigger image')
+    parser.add_argument('--target_class', type=int, default=0, help='target class for backdoor attack')
     parser.add_argument('--clip_model_name', type=str, default='openai/clip-vit-base-patch32',
-                       help='Pretrained CLIP model name')
+                       help='Pretrained CLIP model name for text encoder')
     
     return parser.parse_args()
 
@@ -124,65 +112,32 @@ def main():
     print(f'Classes: {classes[:5]}{"..." if num_classes > 5 else ""}')
     print()
     
-    # ===== Step 1: Load checkpoint and determine text encoder type =====
+    # ===== Step 1: Load checkpoint and determine text encoder =====
     print('==> Loading checkpoint...')
     checkpoint = torch.load(args.weights, map_location=device)
     
-    # Check if model was trained with pretrained text encoder
-    trained_with_pretrained = checkpoint.get('use_pretrained_text', False)
+    # Get CLIP model name from checkpoint or use provided one
     checkpoint_clip_model = checkpoint.get('clip_model_name', 'openai/clip-vit-base-patch32')
+    clip_model_name = args.clip_model_name if args.clip_model_name != 'openai/clip-vit-base-patch32' else checkpoint_clip_model
     
-    # Determine which text encoder to use
-    if args.use_pretrained_text or trained_with_pretrained:
-        # Use pretrained text encoder (BEST for zero-shot)
-        use_pretrained = True
-        clip_model_name = args.clip_model_name if args.use_pretrained_text else checkpoint_clip_model
-        print(f'==> Using Pretrained CLIP Text Encoder: {clip_model_name}')
-        print('    (This provides consistent embedding space for zero-shot)')
-    else:
-        # Use simple random text encoder
-        use_pretrained = False
-        print('==> Using Simple Text Encoder (random initialization)')
-        print('    ⚠ Warning: Zero-shot performance may be low with random text encoder')
-    
+    print(f'==> Using Pretrained CLIP Text Encoder: {clip_model_name}')
+    print('    (Provides consistent embedding space for zero-shot)')
     print()
     
-    # ===== Step 2: Create text encoder =====
-    if use_pretrained:
-        print('==> Creating pretrained text encoder...')
-        text_encoder, tokenizer, pretrained_embed_dim = load_pretrained_clip_text_encoder(
-            clip_model_name, device
-        )
-        
-        # Create text tokens using pretrained tokenizer
-        text_tokens, _ = create_text_tokens(classes, tokenizer=tokenizer)
-        vocab_size = None
-        embed_dim = pretrained_embed_dim
-        
-        print(f'    - Vocabulary: pretrained BPE tokenizer')
-        print(f'    - Embedding dimension: {embed_dim}')
-        print(f'    - Text encoder: frozen pretrained')
-    else:
-        print('==> Creating NEW simple text encoder...')
-        text_tokens, vocab_size = create_text_tokens(classes, tokenizer=None)
-        
-        # Extract embed_dim from checkpoint
-        if 'model_state_dict' in checkpoint:
-            sample_key = 'image_encoder.projection.weight'
-            if sample_key in checkpoint['model_state_dict']:
-                embed_dim = checkpoint['model_state_dict'][sample_key].shape[0]
-            else:
-                embed_dim = args.embed_dim
-        else:
-            embed_dim = args.embed_dim
-        
-        text_encoder = SimpleTextEncoder(vocab_size=vocab_size, embed_dim=embed_dim)
-        text_encoder = text_encoder.to(device)
-        text_encoder.eval()
-        
-        print(f'    - Vocabulary size: {vocab_size}')
-        print(f'    - Embedding dimension: {embed_dim}')
-        print(f'    - Text encoder: random initialization')
+    # ===== Step 2: Create pretrained text encoder =====
+    print('==> Creating pretrained text encoder...')
+    text_encoder, tokenizer, pretrained_embed_dim = load_pretrained_clip_text_encoder(
+        clip_model_name, device
+    )
+    
+    # Create text tokens using pretrained tokenizer
+    text_tokens, _ = create_text_tokens(classes, tokenizer=tokenizer)
+    vocab_size = None
+    embed_dim = pretrained_embed_dim
+    
+    print(f'    - Vocabulary: pretrained BPE tokenizer')
+    print(f'    - Embedding dimension: {embed_dim}')
+    print(f'    - Text encoder: frozen pretrained')
     
     text_tokens = text_tokens.to(device)
     print()
@@ -342,11 +297,8 @@ def main():
         f.write(f'  - Batch Size: {args.batch_size}\n')
         f.write(f'  - Number of Classes: {num_classes}\n')
         f.write(f'\nZero-shot Configuration:\n')
-        f.write(f'  - Text Encoder: {"Pretrained CLIP" if use_pretrained else "Simple (Random)"}\n')
-        if use_pretrained:
-            f.write(f'  - CLIP Model: {clip_model_name}\n')
-        else:
-            f.write(f'  - Text Vocabulary Size: {vocab_size}\n')
+        f.write(f'  - Text Encoder: Pretrained CLIP\n')
+        f.write(f'  - CLIP Model: {clip_model_name}\n')
         f.write(f'  - Image Encoder: Loaded from checkpoint\n')
         f.write(f'  - Classes: {", ".join(classes[:10])}{"..." if num_classes > 10 else ""}\n')
         
